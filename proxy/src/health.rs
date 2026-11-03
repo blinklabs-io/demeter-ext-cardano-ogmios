@@ -13,7 +13,10 @@ async fn get_health(state: &State) -> bool {
     };
 
     let response = match client
-        .get(format!("http://{}/health", state.config.instance("6")))
+        .get(format!(
+            "http://{}/health",
+            state.config.instance(&state.config.health_network, "6")
+        ))
         .send()
         .await
     {

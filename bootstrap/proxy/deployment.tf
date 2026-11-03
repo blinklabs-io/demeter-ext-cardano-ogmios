@@ -47,11 +47,6 @@ resource "kubernetes_deployment_v1" "ogmios_proxy" {
           }
 
           env {
-            name  = "NETWORK"
-            value = var.network
-          }
-
-          env {
             name  = "PROXY_NAMESPACE"
             value = var.namespace
           }
@@ -82,6 +77,11 @@ resource "kubernetes_deployment_v1" "ogmios_proxy" {
           }
 
           env {
+            name  = "HEALTH_NETWORK"
+            value = "cardano-mainnet"
+          }
+
+          env {
             name  = "SSL_CRT_PATH"
             value = "/certs/tls.crt"
           }
@@ -89,6 +89,31 @@ resource "kubernetes_deployment_v1" "ogmios_proxy" {
           env {
             name  = "SSL_KEY_PATH"
             value = "/certs/tls.key"
+          }
+
+          env {
+            name  = "RPC_TELEMETRY_NETWORKS"
+            value = join(",", var.rpc_telemetry_networks)
+          }
+
+          env {
+            name  = "CORS_ALLOW_ORIGIN"
+            value = "*"
+          }
+
+          env {
+            name  = "CORS_ALLOW_METHODS"
+            value = "GET, POST, PUT, DELETE, OPTIONS"
+          }
+
+          env {
+            name  = "CORS_ALLOW_HEADERS"
+            value = "Content-Type, Authorization, X-Requested-With, dmtr-api-key, traceparent"
+          }
+
+          env {
+            name  = "CORS_MAX_AGE"
+            value = "86400"
           }
 
           volume_mount {

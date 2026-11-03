@@ -29,39 +29,47 @@ module "ogmios_v1_feature" {
 module "ogmios_v1_proxies_blue" {
   depends_on = [kubernetes_namespace.namespace]
   source     = "./proxy"
-  for_each   = { for network in var.networks : "${network}" => network }
 
-  network           = each.key
   cloud_provider    = var.cloud_provider
   cluster_issuer    = var.cluster_issuer
   dns_zone          = var.dns_zone
-  dns_names         = lookup(var.dns_names, each.key, [])
+  dns_names         = distinct(flatten(values(var.dns_names)))
   environment       = var.proxy_blue_environment
   extension_name    = var.extension_name
-  extra_annotations = lookup(var.proxy_blue_extra_annotations_by_network, each.value, {})
+  extra_annotations = length(var.proxy_blue_extra_annotations) > 0 ? var.proxy_blue_extra_annotations : (length(var.proxy_blue_extra_annotations_by_network) > 0 ? merge(values(var.proxy_blue_extra_annotations_by_network)...) : {})
+  name              = "proxy-${var.proxy_blue_environment}"
+  networks          = var.networks
   namespace         = var.namespace
   proxy_image_tag   = var.proxy_blue_image_tag
   replicas          = var.proxy_blue_replicas
+  resources         = var.proxy_resources
   tolerations       = var.proxy_tolerations
+  versions          = var.versions
+
+  rpc_telemetry_networks = var.proxy_rpc_telemetry_networks
 }
 
 module "ogmios_v1_proxies_green" {
   depends_on = [kubernetes_namespace.namespace]
   source     = "./proxy"
-  for_each   = { for network in var.networks : "${network}" => network }
 
-  network           = each.key
   cloud_provider    = var.cloud_provider
   cluster_issuer    = var.cluster_issuer
   dns_zone          = var.dns_zone
-  dns_names         = lookup(var.dns_names, each.key, [])
+  dns_names         = distinct(flatten(values(var.dns_names)))
   environment       = var.proxy_green_environment
   extension_name    = var.extension_name
-  extra_annotations = lookup(var.proxy_green_extra_annotations_by_network, each.value, {})
+  extra_annotations = length(var.proxy_green_extra_annotations) > 0 ? var.proxy_green_extra_annotations : (length(var.proxy_green_extra_annotations_by_network) > 0 ? merge(values(var.proxy_green_extra_annotations_by_network)...) : {})
+  name              = "proxy-${var.proxy_green_environment}"
+  networks          = var.networks
   namespace         = var.namespace
   proxy_image_tag   = var.proxy_green_image_tag
   replicas          = var.proxy_green_replicas
+  resources         = var.proxy_resources
   tolerations       = var.proxy_tolerations
+  versions          = var.versions
+
+  rpc_telemetry_networks = var.proxy_rpc_telemetry_networks
 }
 
 // mainnet
@@ -88,6 +96,12 @@ module "ogmios_instances" {
   ogmios_version    = each.value.ogmios_version
   replicas          = each.value.replicas
   image_pull_secret = each.value.image_pull_secret
+
+  node_balancer            = each.value.node_balancer
+  node_srv_record          = each.value.node_srv_record
+  node_max_conn_per_server = each.value.node_max_conn_per_server
+  spread                   = each.value.spread
+
   tolerations = coalesce(each.value.tolerations, [
     {
       effect   = "NoSchedule"

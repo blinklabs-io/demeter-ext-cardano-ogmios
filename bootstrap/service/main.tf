@@ -10,7 +10,7 @@ variable "ogmios_version" {
   type = string
 
   validation {
-    condition     = contains(["5", "6"], var.ogmios_version)
-    error_message = "Invalid version. Allowed values are 5 or 6."
+    condition     = contains(["5", "6", "7"], var.ogmios_version)
+    error_message = "Invalid version. Allowed values are 5, 6 or 7."
   }
 }

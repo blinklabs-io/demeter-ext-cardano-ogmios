@@ -1,0 +1,38 @@
+# Drop-in for the socat sidecar: listen on the unix socket Ogmios already uses
+# and spread its node-to-client sessions over the Ready members of a node pool
+# by least connections. Membership comes from DNS SRV on a headless Service
+# that publishes only Ready pods, so the node's own readiness probe drives it.
+global
+    log stdout format raw local0 info
+
+defaults
+    mode tcp
+    log global
+    option tcplog
+    timeout connect 5s
+    # Matches the node's nginx proxy_timeout 180m.
+    timeout client 3h
+    timeout server 3h
+
+resolvers kube
+    parse-resolv-conf
+    # An SRV answer for a full pool, with its additional records, outgrows the
+    # 512-byte default.
+    accepted_payload_size 8192
+    hold valid 10s
+    hold obsolete 0s
+    resolve_retries 3
+    timeout retry 1s
+
+frontend n2c
+    bind unix@/ipc/node.socket mode 666
+    default_backend nodes
+
+backend nodes
+    balance leastconn
+    # A node that leaves the Ready set loses its sessions at once instead of
+    # keeping them on a stalled node until liveness restarts it. maxconn caps
+    # what a node that accepts TCP but doesn't answer can absorb before
+    # readiness removes it.
+    default-server check inter 2s fall 2 rise 2 slowstart 60s on-marked-down shutdown-sessions resolvers kube init-addr none maxconn ${max_conn_per_server}
+    server-template node ${server_slots} ${srv_record}

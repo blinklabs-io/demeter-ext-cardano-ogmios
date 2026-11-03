@@ -30,7 +30,7 @@ resource "kubernetes_service_v1" "proxy_service_aws" {
     port {
       name        = "health"
       port        = 80
-      target_port = local.prometheus_port
+      target_port = local.proxy_port
       protocol    = "TCP"
     }
 
@@ -64,7 +64,7 @@ resource "kubernetes_service_v1" "proxy_service_gcp" {
     port {
       name        = "health"
       port        = 80
-      target_port = local.prometheus_port
+      target_port = local.proxy_port
       protocol    = "TCP"
     }
 

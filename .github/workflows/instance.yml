@@ -9,6 +9,7 @@ on:
       - ".github/workflows/instance.yml"
       - "docker/ogmios-5/*"
       - "docker/ogmios-6/*"
+      - "docker/ogmios-7/*"
 
 jobs:
   build-images:
@@ -23,6 +24,10 @@ jobs:
           - context: docker/ogmios-6
             file: docker/ogmios-6/Dockerfile
             endpoint: demeter-run/ext-cardano-ogmios-instance-6
+            platforms: linux/amd64,linux/arm64
+          - context: docker/ogmios-7
+            file: docker/ogmios-7/Dockerfile
+            endpoint: demeter-run/ext-cardano-ogmios-instance-7
             platforms: linux/amd64,linux/arm64
 
     continue-on-error: true

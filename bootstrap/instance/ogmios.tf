@@ -7,7 +7,42 @@ locals {
     "--node-config", "/config/config.json",
     "--host", "0.0.0.0"
   ]
-  container_args = var.ogmios_version == "5" ? local.default_args : concat(local.default_args, ["--include-cbor"])
+  container_args = var.ogmios_version == "5" ? local.default_args : concat(
+    local.default_args,
+    ["--include-cbor"],
+    var.ogmios_version == "7" ? ["--metadata-detailed-schema"] : []
+  )
+
+  haproxy       = var.node_balancer == "haproxy"
+  haproxy_image = "haproxy:3.2-alpine@sha256:1392e5f7a83ddf820b020fe2b099f08a2311a9b8e9212c0285119dd13903ff1c"
+  haproxy_config = local.haproxy ? templatefile("${path.module}/haproxy.cfg.tftpl", {
+    # Empty only when the precondition below rejects the instance.
+    srv_record          = var.node_srv_record == null ? "" : var.node_srv_record
+    server_slots        = 8
+    max_conn_per_server = var.node_max_conn_per_server
+  }) : null
+
+  spread_topology_keys = var.spread ? ["kubernetes.io/hostname", "topology.kubernetes.io/zone"] : []
+}
+
+resource "kubernetes_config_map_v1" "haproxy" {
+  count = local.haproxy ? 1 : 0
+
+  metadata {
+    name      = "${local.name}-haproxy"
+    namespace = var.namespace
+  }
+
+  data = {
+    "haproxy.cfg" = local.haproxy_config
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.node_srv_record != null
+      error_message = "node_srv_record is required when node_balancer is haproxy."
+    }
+  }
 }
 
 resource "kubernetes_deployment_v1" "ogmios" {
@@ -50,6 +85,10 @@ resource "kubernetes_deployment_v1" "ogmios" {
           "cardano.demeter.run/network"        = var.network
           "cardano.demeter.run/ogmios-version" = var.ogmios_version
         }
+        # Rolls the pods when the balancer config changes.
+        annotations = local.haproxy ? {
+          "checksum/haproxy-config" = sha256(local.haproxy_config)
+        } : null
       }
       spec {
         restart_policy = "Always"
@@ -140,6 +179,11 @@ resource "kubernetes_deployment_v1" "ogmios" {
           image_pull_policy = "IfNotPresent"
           args              = local.container_args
 
+          env {
+            name  = "NETWORK"
+            value = replace(var.network, "cardano-", "")
+          }
+
           resources {
             limits = {
               cpu    = var.resources.limits.cpu
@@ -191,28 +235,82 @@ resource "kubernetes_deployment_v1" "ogmios" {
           }
         }
 
-        container {
-          name  = "socat"
-          image = "alpine/socat"
-          args = [
-            "UNIX-LISTEN:/ipc/node.socket,reuseaddr,fork,unlink-early",
-            "TCP-CONNECT:${var.node_private_dns}"
-          ]
+        dynamic "container" {
+          for_each = local.haproxy ? [] : [1]
 
-          security_context {
-            run_as_user  = 1000
-            run_as_group = 1000
+          content {
+            name  = "socat"
+            image = "alpine/socat"
+            args = [
+              "UNIX-LISTEN:/ipc/node.socket,reuseaddr,fork,unlink-early",
+              "TCP-CONNECT:${var.node_private_dns}"
+            ]
+
+            security_context {
+              run_as_user  = 1000
+              run_as_group = 1000
+            }
+
+            volume_mount {
+              name       = "ipc"
+              mount_path = "/ipc"
+            }
           }
+        }
 
-          volume_mount {
-            name       = "ipc"
-            mount_path = "/ipc"
+        dynamic "container" {
+          for_each = local.haproxy ? [1] : []
+
+          content {
+            name              = "haproxy"
+            image             = local.haproxy_image
+            image_pull_policy = "IfNotPresent"
+
+            resources {
+              limits = {
+                memory = "128Mi"
+              }
+              requests = {
+                cpu    = "25m"
+                memory = "64Mi"
+              }
+            }
+
+            security_context {
+              run_as_non_root            = true
+              run_as_user                = 1000
+              run_as_group               = 1000
+              allow_privilege_escalation = false
+            }
+
+            volume_mount {
+              name       = "ipc"
+              mount_path = "/ipc"
+            }
+
+            volume_mount {
+              name       = "haproxy-config"
+              mount_path = "/usr/local/etc/haproxy"
+              read_only  = true
+            }
           }
         }
 
         volume {
           name = "ipc"
           empty_dir {}
+        }
+
+        dynamic "volume" {
+          for_each = local.haproxy ? [1] : []
+
+          content {
+            name = "haproxy-config"
+
+            config_map {
+              name = kubernetes_config_map_v1.haproxy[0].metadata[0].name
+            }
+          }
         }
 
         volume {
@@ -243,6 +341,25 @@ resource "kubernetes_deployment_v1" "ogmios" {
             key      = toleration.value.key
             operator = toleration.value.operator
             value    = toleration.value.value
+          }
+        }
+
+        # Spreads every deployment of this network and version together, not
+        # just this instance's replicas.
+        dynamic "topology_spread_constraint" {
+          for_each = local.spread_topology_keys
+          content {
+            max_skew           = 1
+            topology_key       = topology_spread_constraint.value
+            when_unsatisfiable = "ScheduleAnyway"
+
+            label_selector {
+              match_labels = {
+                "role"                               = "instance"
+                "cardano.demeter.run/network"        = var.network
+                "cardano.demeter.run/ogmios-version" = var.ogmios_version
+              }
+            }
           }
         }
       }

@@ -16,23 +16,51 @@ use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::error::Error;
 use std::fmt::Display;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 use std::{fs, io};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::pin;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, WebSocketStream};
 use tracing::{error, info};
 use url::Url;
 
+use crate::body::{buffer_body, BodyEnd, ObservedBody, ReplayBody};
+use crate::config::Config;
 use crate::limiter::limiter;
+use crate::metrics::{RpcCall, RpcScope};
+use crate::rpc::{self, Classification, Correlator, Push, Transport, OVERSIZE_BYTES};
 use crate::utils::{full, get_header, ProxyResponse, DMTR_API_KEY};
 use crate::{Consumer, State};
+
+fn add_cors_headers<B>(response: &mut Response<B>, config: &Config) {
+    let headers = response.headers_mut();
+    headers.insert(
+        "Access-Control-Allow-Origin",
+        HeaderValue::from_str(&config.cors_allow_origin).unwrap(),
+    );
+    headers.insert(
+        "Access-Control-Allow-Methods",
+        HeaderValue::from_str(&config.cors_allow_methods).unwrap(),
+    );
+    headers.insert(
+        "Access-Control-Allow-Headers",
+        HeaderValue::from_str(&config.cors_allow_headers).unwrap(),
+    );
+    headers.insert(
+        "Access-Control-Max-Age",
+        HeaderValue::from_str(&config.cors_max_age).unwrap(),
+    );
+}
 
 pub async fn start(state: Arc<State>) {
     let addr_result = SocketAddr::from_str(&state.config.proxy_addr);
@@ -97,19 +125,33 @@ async fn handle(
     state: Arc<State>,
 ) -> Result<ProxyResponse, hyper::Error> {
     match (hyper_req.method(), hyper_req.uri().path()) {
-        (&Method::GET, "/healthz") => handle_healthz(&state).await,
+        (&Method::OPTIONS, _) => {
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .body(full(""))
+                .unwrap();
+            add_cors_headers(&mut response, &state.config);
+            Ok(response)
+        }
+        (&Method::GET, "/healthz") => {
+            let mut response = handle_healthz(&state).await?;
+            add_cors_headers(&mut response, &state.config);
+            Ok(response)
+        }
         _ => {
             let proxy_req_result = ProxyRequest::new(&mut hyper_req, &state).await;
             if proxy_req_result.is_none() {
-                return Ok(Response::builder()
+                let mut response = Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .body(full("Unauthorized"))
-                    .unwrap());
+                    .unwrap();
+                add_cors_headers(&mut response, &state.config);
+                return Ok(response);
             }
 
             let proxy_req = proxy_req_result.unwrap();
             let response_result = match proxy_req.protocol {
-                Protocol::Http => handle_http(hyper_req, &proxy_req).await,
+                Protocol::Http => handle_http(hyper_req, &proxy_req, &state).await,
                 Protocol::Websocket => {
                     // Before handling the websocket connection, check if consumer has available
                     // connections.
@@ -117,20 +159,26 @@ async fn handle(
                     match tiers.get(&proxy_req.consumer.tier) {
                         Some(tier) => {
                             if proxy_req.consumer.active_connections >= tier.max_connections {
-                                Ok(Response::builder()
+                                let mut response = Response::builder()
                                     .status(StatusCode::TOO_MANY_REQUESTS)
                                     .body(full("Connection limit exceeded"))
-                                    .unwrap())
+                                    .unwrap();
+                                add_cors_headers(&mut response, &state.config);
+                                Ok(response)
                             } else {
                                 handle_websocket(hyper_req, &proxy_req, state.clone()).await
                             }
                         }
-                        None => Ok(Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .body(full(
-                                "Invalid tier value. Contact support team for more information.",
-                            ))
-                            .unwrap()),
+                        None => {
+                            let mut response = Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(full(
+                                    "Invalid tier value. Contact support team for more information.",
+                                ))
+                                .unwrap();
+                            add_cors_headers(&mut response, &state.config);
+                            Ok(response)
+                        }
                     }
                 }
             };
@@ -155,7 +203,36 @@ async fn handle(
 async fn handle_http(
     hyper_req: Request<Incoming>,
     proxy_req: &ProxyRequest,
+    state: &State,
 ) -> Result<ProxyResponse, hyper::Error> {
+    if hyper_req.method() == Method::POST
+        && state
+            .config
+            .rpc_telemetry_networks
+            .enabled_for(&proxy_req.consumer.network)
+    {
+        let mut response = forward_classified(
+            hyper_req,
+            |classification| {
+                let consumer = proxy_req.consumer.to_string();
+                state.metrics.count_rpc_request(
+                    proxy_req,
+                    &consumer,
+                    Transport::Http,
+                    classification,
+                );
+                *classification
+            },
+            |req, classification| {
+                let scope = RpcScope::new(&state.metrics, proxy_req, Transport::Http);
+                send_upstream(req, &proxy_req.instance, scope, classification)
+            },
+        )
+        .await;
+        add_cors_headers(&mut response, &state.config);
+        return Ok(response);
+    }
+
     let stream = TcpStream::connect(&proxy_req.instance).await.unwrap();
     let io: TokioIo<TcpStream> = TokioIo::new(stream);
 
@@ -171,8 +248,114 @@ async fn handle_http(
         }
     });
 
-    let resp = sender.send_request(hyper_req).await?;
+    let mut resp = sender.send_request(hyper_req).await?;
+    add_cors_headers(&mut resp, &state.config);
     Ok(resp.map(|b| b.boxed()))
+}
+
+/// Buffers a POST body far enough to classify it, counts it, and forwards the
+/// identical bytes with the headers as received. A client that aborts before
+/// the body is classified gets a `400` and the upstream is never contacted.
+///
+/// Whatever `count` returns is handed to `upstream` with the request.
+async fn forward_classified<B, T, F, Fut>(
+    hyper_req: Request<B>,
+    count: impl FnOnce(&Classification) -> T,
+    upstream: F,
+) -> ProxyResponse
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
+    B::Error: Display,
+    F: FnOnce(Request<ReplayBody<B>>, T) -> Fut,
+    Fut: Future<Output = ProxyResponse>,
+{
+    let (parts, body) = hyper_req.into_parts();
+    let (prefix, body) = match buffer_body(body, OVERSIZE_BYTES).await {
+        Ok(buffered) => buffered,
+        Err(err) => {
+            error!(error = err.to_string(), "client aborted the request body");
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(full("Incomplete request body"))
+                .unwrap();
+        }
+    };
+
+    let counted = count(&rpc::classify(&prefix));
+
+    upstream(Request::from_parts(parts, body), counted).await
+}
+
+/// Sends a request to the instance and answers any failure itself, so that
+/// the classified path never surfaces an error to `handle`.
+///
+/// The request is timed from just before it is sent to the response headers,
+/// and its response body is counted on the way to the client.
+async fn send_upstream(
+    req: Request<ReplayBody<Incoming>>,
+    instance: &str,
+    scope: RpcScope,
+    classification: Classification,
+) -> ProxyResponse {
+    let failure = |status: StatusCode, err: &dyn Display| {
+        error!(
+            error = err.to_string(),
+            "fail to forward request to instance"
+        );
+        Response::builder()
+            .status(status)
+            .body(full(status.canonical_reason().unwrap_or_default()))
+            .unwrap()
+    };
+
+    let stream = match TcpStream::connect(instance).await {
+        Ok(stream) => stream,
+        Err(err) => return failure(StatusCode::BAD_GATEWAY, &err),
+    };
+    let io: TokioIo<TcpStream> = TokioIo::new(stream);
+
+    let (mut sender, conn) = match http1_client::Builder::new()
+        .preserve_header_case(true)
+        .title_case_headers(true)
+        .handshake(io)
+        .await
+    {
+        Ok(handshake) => handshake,
+        Err(err) => return failure(StatusCode::BAD_GATEWAY, &err),
+    };
+
+    tokio::task::spawn(async move {
+        if let Err(err) = conn.await {
+            println!("Connection failed: {:?}", err);
+        }
+    });
+
+    // Dropping the call unfinished counts it as abandoned, wherever the
+    // client goes away.
+    let call = RpcCall::start(scope, &classification);
+    let sent_at = Instant::now();
+    match sender.send_request(req).await {
+        Ok(resp) => {
+            let duration = sent_at.elapsed();
+            resp.map(|body| {
+                ObservedBody::new(body, move |end| match end {
+                    BodyEnd::Complete { bytes, error } => call.answered(duration, bytes, error),
+                    BodyEnd::Abandoned => drop(call),
+                    BodyEnd::Failed => call.released(),
+                })
+                .boxed()
+            })
+        }
+        // A user error here is the client's body failing mid-stream.
+        Err(err) if err.is_user() => {
+            drop(call);
+            failure(StatusCode::BAD_REQUEST, &err)
+        }
+        Err(err) => {
+            call.released();
+            failure(StatusCode::BAD_GATEWAY, &err)
+        }
+    }
 }
 
 async fn handle_websocket(
@@ -188,7 +371,7 @@ async fn handle_websocket(
     let version = hyper_req.version();
 
     let proxy_req = proxy_req.clone();
-    let state = state.clone();
+    let config = state.config.clone();
 
     tokio::task::spawn(async move {
         match hyper::upgrade::on(&mut hyper_req).await {
@@ -220,15 +403,35 @@ async fn handle_websocket(
                     active_connections, "client connected"
                 );
 
+                // Decided once per connection; the disabled path is this one
+                // branch per message.
+                let telemetry = state
+                    .config
+                    .rpc_telemetry_networks
+                    .enabled_for(&proxy_req.consumer.network)
+                    .then(|| WsTelemetry::new(&state, &proxy_req));
+
                 let client_in = async {
                     while let Some(result) = client_incoming.next().await {
                         match result {
                             Ok(data) => {
+                                // Counted before the limiter so that stalled
+                                // messages still show as demand.
+                                let classification = telemetry.as_ref().and_then(|telemetry| {
+                                    telemetry.received(&state, &proxy_req, &data)
+                                });
                                 if let Err(err) = limiter(state.clone(), &proxy_req.consumer).await
                                 {
                                     error!(error = err.to_string(), "Failed to run limiter.");
                                     break;
                                 };
+                                // Tracked before the send, so that a fast
+                                // response cannot overtake its own entry.
+                                if let (Some(telemetry), Some(classification)) =
+                                    (&telemetry, &classification)
+                                {
+                                    telemetry.forwarding(classification);
+                                }
                                 if let Err(err) = instance_outgoing.send(data).await {
                                     error!(
                                         error = err.to_string(),
@@ -247,10 +450,19 @@ async fn handle_websocket(
                 pin!(client_in);
 
                 let instance_in = instance_incoming
-                    .inspect_ok(|_| state.metrics.count_ws_total_frame(&proxy_req))
+                    .inspect_ok(|message| {
+                        state.metrics.count_ws_total_frame(&proxy_req);
+                        if let Some(telemetry) = &telemetry {
+                            telemetry.answered(message);
+                        }
+                    })
                     .forward(client_outgoing);
 
                 select(client_in, instance_in).await;
+
+                if let Some(telemetry) = &telemetry {
+                    telemetry.closed(&state, &proxy_req);
+                }
 
                 state.metrics.dec_ws_total_connection(&proxy_req);
                 proxy_req.consumer.dec_connections(state.clone()).await;
@@ -277,8 +489,100 @@ async fn handle_websocket(
     res.headers_mut().append(UPGRADE, websocket);
     res.headers_mut()
         .append(SEC_WEBSOCKET_ACCEPT, derived.unwrap().parse().unwrap());
+    add_cors_headers(&mut res, &config);
 
     Ok(res)
+}
+
+/// Request telemetry for one WebSocket connection: what is in flight, and the
+/// session's statistics.
+struct WsTelemetry {
+    consumer: String,
+    scope: RpcScope,
+    /// Never held across an `.await`.
+    correlator: Mutex<Correlator>,
+    requests: AtomicU64,
+    connected_at: Instant,
+}
+
+impl WsTelemetry {
+    fn new(state: &State, proxy_req: &ProxyRequest) -> Self {
+        Self {
+            consumer: proxy_req.consumer.to_string(),
+            scope: RpcScope::new(&state.metrics, proxy_req, Transport::Websocket),
+            correlator: Mutex::default(),
+            requests: AtomicU64::new(0),
+            connected_at: Instant::now(),
+        }
+    }
+
+    fn correlator(&self) -> std::sync::MutexGuard<'_, Correlator> {
+        self.correlator
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Classifies and counts a client message; control frames are not
+    /// requests.
+    fn received(
+        &self,
+        state: &State,
+        proxy_req: &ProxyRequest,
+        message: &Message,
+    ) -> Option<Classification> {
+        let classification = rpc::classify_message(message)?;
+        state.metrics.count_rpc_request(
+            proxy_req,
+            &self.consumer,
+            Transport::Websocket,
+            &classification,
+        );
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        Some(classification)
+    }
+
+    fn forwarding(&self, classification: &Classification) {
+        let push = self.correlator().push(classification, Instant::now());
+        if let Push::Tracked { evicted } = push {
+            self.scope.sent();
+            if evicted.is_some() {
+                self.scope.evicted();
+            }
+        }
+    }
+
+    fn answered(&self, message: &Message) {
+        // Ogmios answers in text frames only.
+        let Message::Text(text) = message else {
+            return;
+        };
+        let response = rpc::scan_response(text.as_bytes());
+        let pending = self.correlator().take(response.id, response.method);
+        match pending {
+            Some(pending) => self.scope.answered(
+                pending.method,
+                pending.shape,
+                pending.sent_at.elapsed(),
+                text.len(),
+                response.error,
+            ),
+            None => self
+                .scope
+                .unmatched_response(response.method, response.error),
+        }
+    }
+
+    fn closed(&self, state: &State, proxy_req: &ProxyRequest) {
+        let abandoned: Vec<_> = self.correlator().drain().collect();
+        for pending in abandoned {
+            self.scope.abandoned(pending.method, pending.shape);
+        }
+        state.metrics.observe_ws_session(
+            proxy_req,
+            self.connected_at.elapsed(),
+            self.requests.load(Ordering::Relaxed),
+        );
+    }
 }
 
 async fn handle_healthz(state: &State) -> Result<ProxyResponse, hyper::Error> {
@@ -339,12 +643,7 @@ impl ProxyRequest {
             .unwrap_or_default();
 
         let consumer = state.get_consumer(&token).await?;
-
-        if consumer.network != state.config.network {
-            return None;
-        }
-
-        let instance = state.config.instance(&consumer.version);
+        let instance = state.config.instance(&consumer.network, &consumer.version);
 
         Some(Self {
             namespace,
@@ -380,4 +679,80 @@ fn load_private_key(path: &PathBuf) -> io::Result<PrivateKeyDer<'static>> {
     let key_file = fs::File::open(path)?;
     let mut reader = io::BufReader::new(key_file);
     rustls_pemfile::private_key(&mut reader).map(|key| key.unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use bytes::Bytes;
+    use futures_util::stream;
+    use http_body_util::StreamBody;
+    use hyper::body::Frame;
+
+    use super::*;
+
+    type Chunk = Result<Frame<Bytes>, &'static str>;
+
+    fn post(chunks: Vec<Chunk>) -> Request<StreamBody<stream::Iter<std::vec::IntoIter<Chunk>>>> {
+        Request::post("/")
+            .header("content-type", "application/json")
+            .body(StreamBody::new(stream::iter(chunks)))
+            .unwrap()
+    }
+
+    fn data(bytes: &'static [u8]) -> Chunk {
+        Ok(Frame::data(Bytes::from_static(bytes)))
+    }
+
+    #[tokio::test]
+    async fn a_client_abort_is_answered_without_contacting_the_upstream() {
+        let counted = Cell::new(false);
+        let contacted = Cell::new(false);
+
+        let response = forward_classified(
+            post(vec![data(b"{\"method\":"), Err("connection reset")]),
+            |_| counted.set(true),
+            |_, _| {
+                contacted.set(true);
+                async { Response::new(full("")) }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!counted.get());
+        assert!(!contacted.get());
+    }
+
+    #[tokio::test]
+    async fn a_classified_post_is_forwarded_unchanged() {
+        let mut counted = None;
+
+        let response = forward_classified(
+            post(vec![
+                data(b"{\"jsonrpc\":\"2.0\",\"method\":"),
+                data(b"\"queryNetwork/tip\"}"),
+            ]),
+            |classification| counted = Some(*classification),
+            |req, _| async move {
+                assert_eq!(req.headers()["content-type"], "application/json");
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(
+                    &body[..],
+                    b"{\"jsonrpc\":\"2.0\",\"method\":\"queryNetwork/tip\"}"
+                );
+                Response::new(full("ok"))
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let counted = counted.unwrap();
+        assert_eq!(counted.method, rpc::Method::QueryNetworkTip);
+        assert_eq!(
+            counted.bytes,
+            r#"{"jsonrpc":"2.0","method":"queryNetwork/tip"}"#.len()
+        );
+    }
 }

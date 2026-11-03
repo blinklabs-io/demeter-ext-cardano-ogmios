@@ -1,6 +1,6 @@
 locals {
-  name = "proxy-${var.network}-${var.environment}"
-  role = "proxy-${var.network}-${var.environment}"
+  name = var.name
+  role = "proxy-${var.environment}"
 
   prometheus_port = 9187
   prometheus_addr = "0.0.0.0:${local.prometheus_port}"
@@ -9,12 +9,17 @@ locals {
   proxy_labels    = { role = "${local.role}" }
 
   by_version = flatten([
-    for version in var.versions : "*.${var.network}-v${version}.${var.extension_name}.${var.dns_zone}"
+    for combo in setproduct(var.networks, var.versions) : "*.${combo[0]}-v${combo[1]}.${var.extension_name}.${var.dns_zone}"
   ])
 
   # Add the extra URL to the list of generated URLs
   dns_names        = length(var.dns_names) > 0 ? var.dns_names : concat(local.by_version, ["*.${var.extension_name}.${var.dns_zone}"])
-  cert_secret_name = var.environment != null ? "${var.extension_name}-${var.environment}-${var.network}-wildcard-tls" : "${var.extension_name}-${var.network}-wildcard-tls"
+  cert_secret_name = "${var.extension_name}-${var.environment}-wildcard-tls"
+}
+
+variable "name" {
+  type    = string
+  default = "proxy"
 }
 
 // blue - green
@@ -74,8 +79,8 @@ variable "extension_name" {
   type = string
 }
 
-variable "network" {
-  type = string
+variable "networks" {
+  type = list(string)
 }
 
 variable "versions" {
@@ -101,6 +106,12 @@ variable "cluster_issuer" {
 variable "cloud_provider" {
   type    = string
   default = "aws"
+}
+
+variable "rpc_telemetry_networks" {
+  description = "Networks whose client JSON-RPC messages are classified and counted; empty disables it"
+  type        = list(string)
+  default     = []
 }
 
 variable "healthcheck_port" {

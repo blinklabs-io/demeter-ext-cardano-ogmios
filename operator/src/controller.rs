@@ -35,7 +35,11 @@ pub static OGMIOS_PORT_FINALIZER: &str = "ogmiosports.demeter.run";
 pub struct OgmiosPortSpec {
     pub network: String,
     pub version: u8,
-    // throughput should be 0, 1, 2
+    // Self-serve tiers are "0" through "3"; "4" is the internal enterprise
+    // tier, assigned only through the backoffice and never offered as a
+    // customer choice. Kept a free-form string on purpose: the proxy resolves
+    // it against its own tier configuration, so adding a tier is a config
+    // change and not a CRD schema change.
     pub throughput_tier: String,
     pub auth_token: Option<String>,
 }

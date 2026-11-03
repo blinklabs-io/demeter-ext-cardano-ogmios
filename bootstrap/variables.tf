@@ -135,6 +135,12 @@ EOT
   default     = {}
 }
 
+variable "proxy_green_extra_annotations" {
+  description = "Shared extra annotations for the green proxy service"
+  type        = map(string)
+  default     = {}
+}
+
 variable "proxy_green_environment" {
   type    = string
   default = "green"
@@ -159,9 +165,25 @@ EOT
   default     = {}
 }
 
+variable "proxy_blue_extra_annotations" {
+  description = "Shared extra annotations for the blue proxy service"
+  type        = map(string)
+  default     = {}
+}
+
 variable "proxy_blue_environment" {
   type    = string
   default = "blue"
+}
+
+variable "proxy_rpc_telemetry_networks" {
+  description = <<EOT
+Networks whose client JSON-RPC messages the proxies classify and count, matched
+exactly against the consumer's network ("*" enables every network). Empty
+disables request telemetry and its recording rules.
+EOT
+  type        = list(string)
+  default     = []
 }
 
 variable "proxy_resources" {
@@ -225,6 +247,11 @@ variable "instances" {
     ogmios_version    = string
     replicas          = number
     image_pull_secret = optional(string)
+    # Node balancing and pod placement; see the instance module's variables.
+    node_balancer            = optional(string, "socat")
+    node_srv_record          = optional(string)
+    node_max_conn_per_server = optional(number, 200)
+    spread                   = optional(bool, false)
     resources = optional(object({
       limits = object({
         cpu    = string

@@ -81,6 +81,33 @@ impl Metrics {
     }
 }
 
+/// Builds the PromQL that meters an Ogmios port over `interval` seconds ending
+/// at `timestamp` (Unix seconds).
+///
+/// The billed quantity is a *message the proxy served*, so both counters are
+/// counter-shaped `increase(...)` — never an average of the
+/// `ogmios_proxy_total_connections` gauge, which is a capacity signal and a
+/// tier constraint, not a billed quantity.
+///
+/// Two details are load bearing:
+///
+/// - `protocol="http"` excludes the WebSocket upgrade. The proxy counts
+///   `http_total_request` once for *every* proxied request, including the
+///   upgrade (which answers `101`), so without the filter each WebSocket
+///   connection would bill one phantom message on top of its frames.
+/// - `or` unions the two counters *inside* the `sum`. A `+` between aggregated
+///   vectors drops any series missing on either side, which would bill a
+///   WebSocket-only consumer — the common case — zero.
+fn build_usage_query(interval: i64, timestamp: i64) -> String {
+    format!(
+        "sum by (consumer, route, tier) (\
+           increase(ogmios_proxy_ws_total_frame[{interval}s] @ {timestamp}) \
+           or \
+           increase(ogmios_proxy_http_total_request{{protocol=\"http\", status_code!~\"401|429|503\"}}[{interval}s] @ {timestamp})\
+         )"
+    )
+}
+
 #[instrument("metrics collector run", skip_all)]
 pub async fn run_metrics_collector(state: Arc<State>) {
     tokio::spawn(async move {
@@ -100,10 +127,7 @@ pub async fn run_metrics_collector(state: Arc<State>) {
 
             last_execution = end;
 
-            let query = format!(
-                "sum by (consumer, route, tier) (avg_over_time(ogmios_proxy_total_connections[{interval}s] @ {}))",
-                end.timestamp_millis() / 1000
-            );
+            let query = build_usage_query(interval, end.timestamp_millis() / 1000);
 
             let response = match client
                 .get(format!("{}/query?query={query}", config.prometheus_url))
@@ -154,12 +178,10 @@ pub async fn run_metrics_collector(state: Arc<State>) {
                     continue;
                 }
 
-                let total_exec_time = result.value * (interval as f64);
-
                 if let Some(tier) = result.metric.tier {
                     state
                         .metrics
-                        .count_usage(project, resource_name, &tier, total_exec_time);
+                        .count_usage(project, resource_name, &tier, result.value);
                 }
             }
         }
@@ -201,4 +223,39 @@ where
         .unwrap()
         .parse::<f64>()
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_usage_query;
+
+    #[test]
+    fn usage_query_is_the_counter_union() {
+        assert_eq!(
+            build_usage_query(60, 1721000000),
+            "sum by (consumer, route, tier) (increase(ogmios_proxy_ws_total_frame[60s] @ 1721000000) or increase(ogmios_proxy_http_total_request{protocol=\"http\", status_code!~\"401|429|503\"}[60s] @ 1721000000))"
+        );
+    }
+
+    /// A `+` between the two aggregated vectors would drop any series missing
+    /// on either side, billing a WebSocket-only consumer zero. The union must
+    /// be `or`, and it must sit inside the `sum`.
+    #[test]
+    fn usage_query_unions_with_or_never_plus() {
+        let query = build_usage_query(300, 1721000000);
+
+        assert!(query.contains(" or "));
+        assert!(!query.contains(" + "));
+        assert!(query.starts_with("sum by (consumer, route, tier) ("));
+    }
+
+    /// The gauge is a capacity signal and the tier's max-connections
+    /// constraint — never a billed quantity.
+    #[test]
+    fn usage_query_never_meters_the_connections_gauge() {
+        let query = build_usage_query(300, 1721000000);
+
+        assert!(!query.contains("ogmios_proxy_total_connections"));
+        assert!(!query.contains("avg_over_time"));
+    }
 }
